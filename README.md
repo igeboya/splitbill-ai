@@ -98,6 +98,15 @@ Omit `participants` and it defaults to `["Person 1","Person 2"]`.
 `[{type:"image_url"},{type:"text"}]`. The system prompt forces a JSON array reply, and the
 parser tolerates code fences and stray prose.
 
+## Proof
+
+| Evidence | Where |
+|---|---|
+| 12-node workflow | `docs/workflow-canvas.jpg` |
+| Test receipt fed to the workflow | `docs/sample-receipt.png` |
+| Payer balance after capture: **USD 4,997.85** (5,000 − 2.15) | `docs/paypal-balance.jpg` |
+| Captured order `74K2556111654951E` | status `COMPLETED`, 2.15 USD, sandbox |
+
 ## Limitations
 
 - IDR is not a PayPal-supported currency, so totals are converted at a fixed
