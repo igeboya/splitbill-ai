@@ -1,0 +1,364 @@
+{
+  "name": "SplitBill AI - Smart Split Bill",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "split-bill",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1c6c1eda-0b74-4f16-afc3-f2481654ff53",
+      "name": "Webhook - Receive Receipt",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        320
+      ],
+      "webhookId": "ddb9f53e-f6e2-4eed-ae29-88a81b0b9edd"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Bangun body request Groq (vision) dari payload webhook\nconst input = $input.first().json;\nconst body = input.body ?? input;\n\nlet image = body.image ?? body.image_url ?? body.imageUrl;\nif (!image) throw new Error('Field \"image\" wajib: kirim URL publik atau data URL base64 di body');\n\n// Kalau yang dikirim cuma base64 mentah, bungkus jadi data URL\nif (!/^https?:\\/\\//i.test(image) && !image.startsWith('data:')) {\n  image = 'data:image/jpeg;base64,' + String(image).replace(/\\s/g, '');\n}\n\nconst raw = body.participants;\nconst participants = (Array.isArray(raw) && raw.length ? raw : ['Person 1', 'Person 2'])\n  .map(p => (typeof p === 'string' ? p : (p && p.name) || String(p)))\n  .filter(Boolean);\n\nreturn [{\n  json: {\n    participants,\n    groqBody: {\n      model: 'gemini-3.5-flash-lite',\n      temperature: 0,\n      max_tokens: 2000,\n      messages: [\n        {\n          role: 'system',\n          content: 'You extract receipt line items. Reply with ONLY a JSON array, no markdown: [{\"name\":\"Item\",\"qty\":1,\"unit_price\":15000,\"total\":15000}]. Prices are IDR integers.'\n        },\n        {\n          role: 'user',\n          content: [\n            { type: 'image_url', image_url: { url: image } },\n            { type: 'text', text: 'Extract every line item with qty, unit price and line total.' }\n          ]\n        }\n      ]\n    }\n  }\n}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "a1cd0234-b8ec-4194-a830-803c74e9cd52",
+      "name": "Prepare AI Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.groqBody }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "9ad12790-f085-400f-a7ed-ecd6c44740a0",
+      "name": "AI OCR - Extract Items",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse jawaban Groq, hitung total & bagian per orang, keluarkan 1 item per peserta\nconst receipt = $input.first().json;\nconst raw = (receipt.choices && receipt.choices[0] && receipt.choices[0].message && receipt.choices[0].message.content) || '';\n\nlet items = [];\ntry {\n  items = JSON.parse(raw);\n} catch (e) {\n  const m = raw.match(/\\[[\\s\\S]*\\]/);\n  if (m) { try { items = JSON.parse(m[0]); } catch (e2) { items = []; } }\n}\nif (!Array.isArray(items)) items = [];\n\nitems = items\n  .filter(i => i && i.name && Number(i.total) > 0)\n  .map(i => {\n    const qty = Number(i.qty) || 1;\n    const total = Number(i.total);\n    return {\n      name: String(i.name),\n      qty,\n      unit_price: Number(i.unit_price) || Math.round(total / qty),\n      total\n    };\n  });\n\nif (!items.length) throw new Error('Groq tidak mengembalikan item valid. Cek gambar / kuota API key.');\n\nconst prep = $('Prepare AI Request').first().json;\nconst participants = prep.participants;\nconst total = items.reduce((s, i) => s + i.total, 0);\nconst perPerson = Math.round(total / participants.length);\n\n// PayPal tidak mendukung IDR -> tagih dalam USD\nconst IDR_PER_USD = 16000;\nconst chargeAmount = Math.max(0.01, Math.round((perPerson / IDR_PER_USD) * 100) / 100).toFixed(2);\n\nreturn participants.map((participant, idx) => ({\n  json: {\n    participant,\n    index: idx,\n    participants,\n    items,\n    total,\n    perPerson,\n    currency: 'IDR',\n    chargeCurrency: 'USD',\n    chargeAmount\n  }\n}));\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "a8e45065-0fc9-4608-ad41-297c4a175b7d",
+      "name": "Process & Calculate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"intent\":\"CAPTURE\",\"purchase_units\":[{\"amount\":{\"currency_code\":\"USD\",\"value\":\"{{ $json.chargeAmount }}\"},\"description\":\"SplitBill AI - {{ $json.participant }} share ({{ $json.perPerson }} {{ $json.currency }})\"}],\"application_context\":{\"brand_name\":\"SplitBill AI\",\"landing_page\":\"LOGIN\",\"user_action\":\"PAY_NOW\",\"return_url\":\"https://bengss.app.n8n.cloud/webhook/paypal-capture\",\"cancel_url\":\"https://bengss.app.n8n.cloud/webhook/paypal-capture?token=cancelled\"}}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "08060f62-e655-489e-a170-8787a5886a96",
+      "name": "PayPal Create Order (per person)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1180,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ambil approval URL PayPal + tempel data peserta (urutan sama dengan node Process & Calculate)\nconst proc = $('Process & Calculate').all();\nreturn $input.all().map((item, i) => {\n  const d = item.json || {};\n  const p = (proc[i] && proc[i].json) || {};\n  const links = Array.isArray(d.links) ? d.links : [];\n  const approve = links.find(l => l && l.rel === 'approve');\n  return {\n    json: {\n      participant: p.participant || null,\n      amount_idr: p.perPerson || null,\n      amount_usd: p.chargeAmount || null,\n      order_id: d.id || null,\n      status: d.status || null,\n      approval_url: approve ? approve.href : null\n    }\n  };\n});\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "e9e04571-2539-45e6-a88f-4cdab1901970",
+      "name": "Extract Approval URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Extract Approval URL').all().length ? { success: true, currency: $('Process & Calculate').first().json.currency, total: $('Process & Calculate').first().json.total, per_person: $('Process & Calculate').first().json.perPerson, participants: $('Process & Calculate').first().json.participants, items: $('Process & Calculate').first().json.items, payments: $('Extract Approval URL').all().map(i => i.json) } : { success: false, error: 'no order created' } }}",
+        "options": {}
+      },
+      "id": "e0b84e9a-6345-4c25-aa8d-f54f7bac558d",
+      "name": "Respond - Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1660,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "paypal-capture",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "f8704b5e-d6cd-44a9-a2ca-3bb457295858",
+      "name": "Webhook - PayPal Return",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        620
+      ],
+      "webhookId": "736a93da-1fc1-4c18-aa22-459f796507da"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ambil order id dari query PayPal (?token=ORDER_ID) dan siapkan URL capture\nconst q = ($input.first().json.query) || {};\nconst orderId = q.token || q.order_id || q.orderId;\nif (!orderId) throw new Error('Query ?token=<order id> tidak ada. Pastikan return_url diarahkan ke webhook ini.');\nreturn [{ json: { orderId, payerId: q.PayerID || null } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "12c0b7a4-cefa-4ebb-aed4-939cf67d9e17",
+      "name": "Read Order ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api-m.sandbox.paypal.com/v2/checkout/orders/{{ $json.orderId }}/capture",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "222ee5fc-b4f6-4956-aed2-4512b9c34dd1",
+      "name": "PayPal Capture Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Susun halaman HTML bukti bayar dari respons PayPal capture (execution terpisah, jangan rujuk node workflow lain)\nconst d = $input.first().json || {};\nconst unit = (d.purchase_units && d.purchase_units[0]) || {};\nconst cap = (unit.payments && unit.payments.captures && unit.payments.captures[0]) || {};\nconst ok = d.status === 'COMPLETED';\nconst paid = cap.amount ? cap.amount.value + ' ' + cap.amount.currency_code : '-';\nconst payer = (d.payer && d.payer.name) ? [d.payer.name.given_name, d.payer.name.surname].filter(Boolean).join(' ') : 'Payer';\nconst who = unit.custom_id || unit.description || '-';\nconst html = '<!doctype html><html><head><meta charset=\"utf-8\"><title>SplitBill AI</title>'\n  + '<style>body{font-family:system-ui,-apple-system,sans-serif;background:#0f1115;color:#e8eaed;'\n  + 'display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:24px}'\n  + '.card{background:#181b21;border:1px solid #2a2f3a;border-radius:16px;padding:32px;max-width:480px;width:100%}'\n  + 'h1{font-size:22px;margin:0 0 6px}.ok{color:#4ade80}.bad{color:#f87171}'\n  + 'dl{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;margin:24px 0 0;font-size:14px}'\n  + 'dt{color:#8a93a3}dd{margin:0;text-align:right;color:#e8eaed}small{color:#8a93a3}'\n  + '.badge{display:inline-block;background:#14321f;color:#4ade80;border-radius:999px;padding:2px 10px;font-size:12px;margin-left:8px}'\n  + '</style></head><body><div class=\"card\">'\n  + '<h1 class=\"' + (ok ? 'ok' : 'bad') + '\">' + (ok ? 'Payment captured' : 'Payment ' + (d.status || 'unknown')) + '</h1>'\n  + '<small>SplitBill AI &middot; PayPal sandbox' + (ok ? '<span class=\"badge\">PAID</span>' : '') + '</small>'\n  + '<dl><dt>Payer</dt><dd>' + payer + '</dd>'\n  + '<dt>For</dt><dd>' + who + '</dd>'\n  + '<dt>Amount</dt><dd>' + paid + '</dd>'\n  + '<dt>Order</dt><dd>' + (d.id || '-') + '</dd></dl>'\n  + '</div></body></html>';\nreturn [{ json: { status: ok ? 200 : 402, html } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "fdd2884b-0e06-45c8-acd6-6edc0977e2c5",
+      "name": "Build Receipt Page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": "={{ $json.status }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "8854bb83-b060-455e-a446-f0a35d4c532a",
+      "name": "Respond - Receipt Page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1180,
+        620
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook - Receive Receipt": {
+      "main": [
+        [
+          {
+            "node": "Prepare AI Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare AI Request": {
+      "main": [
+        [
+          {
+            "node": "AI OCR - Extract Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI OCR - Extract Items": {
+      "main": [
+        [
+          {
+            "node": "Process & Calculate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process & Calculate": {
+      "main": [
+        [
+          {
+            "node": "PayPal Create Order (per person)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PayPal Create Order (per person)": {
+      "main": [
+        [
+          {
+            "node": "Extract Approval URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Approval URL": {
+      "main": [
+        [
+          {
+            "node": "Respond - Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook - PayPal Return": {
+      "main": [
+        [
+          {
+            "node": "Read Order ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Order ID": {
+      "main": [
+        [
+          {
+            "node": "PayPal Capture Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PayPal Capture Order": {
+      "main": [
+        [
+          {
+            "node": "Build Receipt Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Receipt Page": {
+      "main": [
+        [
+          {
+            "node": "Respond - Receipt Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "active": false
+}
